@@ -13,7 +13,6 @@ import kotlin.math.roundToInt
 class Core {
     var price: Double = 0.0
 
-    var areaValue: Set<Double>? = null
     var fairValue: Double = 0.0
 
     class TradeLog{
@@ -25,11 +24,11 @@ class Core {
     private val klineChannel = Channel<BinanceKline?>(Channel.UNLIMITED)
     private val tradeChannel = Channel<BinanceTrade?>(Channel.UNLIMITED)
 
-    var pvtPoint: OHLCVT? = null
+    var pvtHigh: OHLCVT? = null
+    var pvtLow: OHLCVT? = null
 
-    val pvtLength = 47
-    val areaVolumeP = 0.68
-    val areaBarA = 27
+    val pvtLength = 2
+    val areaBarA = 25
 
     val ohlcvts = FixedCapacityOHLCVTQueue(1000)
     val pivotDetector = PivotDetector(ohlcvts, pvtLength, pvtLength)
@@ -53,58 +52,10 @@ class Core {
             return grouped
         }
 
-        fun Map<Double, Pair<Double, Long>>.calculateValueArea(targetPercent: Double = areaVolumeP): Set<Double> {
-            if (this.isEmpty() || targetPercent <= 0 || targetPercent > 1.0) return emptySet()
-            val sortedEntries = this.entries.sortedByDescending { it.key }
-            val totalVolume = this.values.sumOf { it.first }
-            if (totalVolume <= 0) return emptySet()
-            val pocEntry = sortedEntries.maxByOrNull { it.value.first } ?: return emptySet()
-            val pocIndex = sortedEntries.indexOf(pocEntry)
-
-            val valueAreaPrices = mutableSetOf<Double>().apply { add(pocEntry.key) }
-            var valueAreaVolume = pocEntry.value.first
-            if (valueAreaVolume >= totalVolume * targetPercent) return valueAreaPrices
-
-            var leftIndex = pocIndex - 1
-            var rightIndex = pocIndex + 1
-
-            while (valueAreaVolume < totalVolume * targetPercent &&
-                (leftIndex >= 0 || rightIndex < sortedEntries.size)) {
-                val leftCandidate = leftIndex.takeIf { it >= 0 }?.let { sortedEntries[it] }
-                val rightCandidate = rightIndex.takeIf { it < sortedEntries.size }?.let { sortedEntries[it] }
-
-                when {
-                    leftCandidate != null && rightCandidate != null -> {
-                        if (leftCandidate.value.first >= rightCandidate.value.first) {
-                            valueAreaPrices.add(leftCandidate.key)
-                            valueAreaVolume += leftCandidate.value.first
-                            leftIndex--
-                        } else {
-                            valueAreaPrices.add(rightCandidate.key)
-                            valueAreaVolume += rightCandidate.value.first
-                            rightIndex++
-                        }
-                    }
-                    leftCandidate != null -> {
-                        valueAreaPrices.add(leftCandidate.key)
-                        valueAreaVolume += leftCandidate.value.first
-                        leftIndex--
-                    }
-                    rightCandidate != null -> {
-                        valueAreaPrices.add(rightCandidate.key)
-                        valueAreaVolume += rightCandidate.value.first
-                        rightIndex++
-                    }
-                }
-            }
-
-            return valueAreaPrices
-        }
 
         override fun toString(): String {
             val grouped = group(areaBarA)
             if (grouped.isEmpty()) return "No data"
-            val valueAreaPrices = grouped.calculateValueArea()
             val sortedEntries = grouped.entries.sortedByDescending { it.key }
             val maxVolume = sortedEntries.maxOfOrNull { it.value.first } ?: 0.0
             val targetGroupedPrice = if (price != 0.0 && this.isNotEmpty()) {
@@ -122,19 +73,19 @@ class Core {
             return buildString {
                 sortedEntries.forEach { (currentPrice, pair) ->
                     val isPoc = (pair.first == maxVolume)
-                    val isInValueArea = currentPrice in valueAreaPrices
+                    var isValue = false
+                    if (pvtLow != null && pvtHigh != null) {
+                        isValue = (currentPrice > pvtLow!!.low && currentPrice < pvtHigh!!.high)
+                    }
                     val isTargetPrice = (currentPrice == targetGroupedPrice)
-
                     if(isPoc) {
                         fairValue = currentPrice
-                        areaValue = valueAreaPrices
                     }
 
                     val prefix = if (isTargetPrice) "> " else "  "
-
                     val volumeColor = when {
                         isPoc -> RED
-                        isInValueArea -> GREEN
+                        isValue -> GREEN
                         else -> ""
                     }
 
@@ -165,34 +116,32 @@ class Core {
         }
 
         if (ohlcvts.size() > 0) {
-            val pvtHigh = pivotDetector.pivothigh()
+            var pvtHigh = pivotDetector.pivothigh()
             val pvtLow = pivotDetector.pivotlow()
             if (pvtHigh != null) {
                 ohlcvts.removeByTimestamp(pvtHigh.timestamp)
                 pvMap.entries.removeAll { entry ->
                     entry.value.second < pvtHigh.timestamp
                 }
-                pvtPoint = pvtHigh
+                this@Core.pvtHigh = pvtHigh
             }
             if (pvtLow != null) {
                 ohlcvts.removeByTimestamp(pvtLow.timestamp)
                 pvMap.entries.removeAll { entry ->
                     entry.value.second < pvtLow.timestamp
                 }
-                pvtPoint = pvtLow
+                this@Core.pvtLow = pvtLow
             }
         }
 
-        if(fairValue > 0 && areaValue != null){
-            if (price < areaValue!!.max() && price > areaValue!!.min()) {
-                if (price > fairValue) {
-                    tradeLog.positionList.add(-price)
-                    tradeLog.position--
-                }
-                if (price < fairValue) {
-                    tradeLog.positionList.add(price)
-                    tradeLog.position++
-                }
+        if(fairValue > 0 && pvtHigh != null && pvtLow != null) {
+            if (price > fairValue && price < pvtHigh!!.high) {
+                tradeLog.positionList.add(-price)
+                tradeLog.position--
+            }
+            if (price < fairValue && price > pvtLow!!.low) {
+                tradeLog.positionList.add(price)
+                tradeLog.position++
             }
         }
 
@@ -207,8 +156,7 @@ class Core {
                 trade.tradeTime
             )
         price = trade.price.toDouble()
-        safePrint("[${pvtPoint?.timestamp}] [${pvMap.size}] " +
-                "\n[${fairValue}] [${areaValue?.min()} - ${areaValue?.max()}]" +
+        safePrint("[${pvtLow?.low}] - [${pvtHigh?.high}] " +
                 "\nTrader: ${tradeLog.positionList.sum()} Position: ${tradeLog.position}\n" + pvMap.toString())
     }
 
