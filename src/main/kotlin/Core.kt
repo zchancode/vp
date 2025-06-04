@@ -26,6 +26,7 @@ class Core {
 
     var pvtHigh: OHLCVT? = null
     var pvtLow: OHLCVT? = null
+    var step:Int = 0
 
     val pvtLength = 2
     val areaBarA = 25
@@ -120,16 +121,25 @@ class Core {
             val pvtLow = pivotDetector.pivotlow()
             if (pvtHigh != null) {
                 ohlcvts.removeByTimestamp(pvtHigh.timestamp)
-                pvMap.entries.removeAll { entry ->
-                    entry.value.second < pvtHigh.timestamp
+                step += 1
+                if(step < -1) step = 0
+                if (step == 0){
+                    pvMap.entries.removeAll { entry ->
+                        entry.value.second < pvtHigh.timestamp
+                    }
                 }
                 this@Core.pvtHigh = pvtHigh
             }
             if (pvtLow != null) {
                 ohlcvts.removeByTimestamp(pvtLow.timestamp)
-                pvMap.entries.removeAll { entry ->
-                    entry.value.second < pvtLow.timestamp
+                step -= 1
+                if(step > 1) step = 0
+                if (step == 0){
+                    pvMap.entries.removeAll { entry ->
+                        entry.value.second < pvtLow.timestamp
+                    }
                 }
+
                 this@Core.pvtLow = pvtLow
             }
         }
@@ -156,7 +166,7 @@ class Core {
                 trade.tradeTime
             )
         price = trade.price.toDouble()
-        safePrint("[${pvtLow?.low}] - [${pvtHigh?.high}] " +
+        safePrint("[${pvtLow?.low}] - [${pvtHigh?.high}] [${step}]" +
                 "\nTrader: ${tradeLog.positionList.sum()} Position: ${tradeLog.position}\n" + pvMap.toString())
     }
 
