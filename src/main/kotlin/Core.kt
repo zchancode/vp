@@ -1,7 +1,10 @@
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.consumeEach
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.collections.forEach
 import kotlin.math.roundToInt
@@ -19,8 +22,10 @@ class Core {
         var position: Int = 0
     }
     val tradeLog: TradeLog = TradeLog()
+    private val klineChannel = Channel<BinanceKline?>(Channel.UNLIMITED)
+    private val tradeChannel = Channel<BinanceTrade?>(Channel.UNLIMITED)
 
-
+    var pvtPoint: OHLCVT? = null
 
     val pvtLength = 47
     val areaVolumeP = 0.68
@@ -50,13 +55,9 @@ class Core {
 
         fun Map<Double, Pair<Double, Long>>.calculateValueArea(targetPercent: Double = areaVolumeP): Set<Double> {
             if (this.isEmpty() || targetPercent <= 0 || targetPercent > 1.0) return emptySet()
-
-            // 按价格降序排序
             val sortedEntries = this.entries.sortedByDescending { it.key }
             val totalVolume = this.values.sumOf { it.first }
             if (totalVolume <= 0) return emptySet()
-
-            // 找到POC（最高成交量价格）
             val pocEntry = sortedEntries.maxByOrNull { it.value.first } ?: return emptySet()
             val pocIndex = sortedEntries.indexOf(pocEntry)
 
@@ -69,13 +70,10 @@ class Core {
 
             while (valueAreaVolume < totalVolume * targetPercent &&
                 (leftIndex >= 0 || rightIndex < sortedEntries.size)) {
-
-                // 获取左右候选成交量（如果存在）
                 val leftCandidate = leftIndex.takeIf { it >= 0 }?.let { sortedEntries[it] }
                 val rightCandidate = rightIndex.takeIf { it < sortedEntries.size }?.let { sortedEntries[it] }
 
                 when {
-                    // 优先选择成交量较大的一侧
                     leftCandidate != null && rightCandidate != null -> {
                         if (leftCandidate.value.first >= rightCandidate.value.first) {
                             valueAreaPrices.add(leftCandidate.key)
@@ -87,13 +85,11 @@ class Core {
                             rightIndex++
                         }
                     }
-                    // 只有左侧可选
                     leftCandidate != null -> {
                         valueAreaPrices.add(leftCandidate.key)
                         valueAreaVolume += leftCandidate.value.first
                         leftIndex--
                     }
-                    // 只有右侧可选
                     rightCandidate != null -> {
                         valueAreaPrices.add(rightCandidate.key)
                         valueAreaVolume += rightCandidate.value.first
@@ -108,8 +104,6 @@ class Core {
         override fun toString(): String {
             val grouped = group(areaBarA)
             if (grouped.isEmpty()) return "No data"
-
-            // 计算价值区域（使用新增函数）
             val valueAreaPrices = grouped.calculateValueArea()
             val sortedEntries = grouped.entries.sortedByDescending { it.key }
             val maxVolume = sortedEntries.maxOfOrNull { it.value.first } ?: 0.0
@@ -136,8 +130,6 @@ class Core {
                         areaValue = valueAreaPrices
                     }
 
-
-
                     val prefix = if (isTargetPrice) "> " else "  "
 
                     val volumeColor = when {
@@ -157,73 +149,96 @@ class Core {
         }
     }
 
+    private fun processKlineInternal(kline: BinanceKline?) {
+        if (kline?.klineData == null) return
+        val ohlcvt = OHLCVT(
+            open = kline.klineData.openPrice.toDouble(),
+            high = kline.klineData.highPrice.toDouble(),
+            low = kline.klineData.lowPrice.toDouble(),
+            close = kline.klineData.closePrice.toDouble(),
+            volume = kline.klineData.baseAssetVolume.toDouble(),
+            timestamp = kline.klineData.startTime
+        )
+        if (ohlcvts.size() > 0 && ohlcvts[0].timestamp == ohlcvt.timestamp) {
+            ohlcvts[0] = ohlcvt
+            return
+        }
 
-    fun processKline(kline: BinanceKline?) {
-        GlobalScope.launch(Dispatchers.IO) {
-            if (kline?.klineData == null) return@launch
-            val ohlcvt = OHLCVT(
-                open = kline.klineData.openPrice.toDouble(),
-                high = kline.klineData.highPrice.toDouble(),
-                low = kline.klineData.lowPrice.toDouble(),
-                close = kline.klineData.closePrice.toDouble(),
-                volume = kline.klineData.baseAssetVolume.toDouble(),
-                timestamp = kline.klineData.startTime
+        if (ohlcvts.size() > 0) {
+            val pvtHigh = pivotDetector.pivothigh()
+            val pvtLow = pivotDetector.pivotlow()
+            if (pvtHigh != null) {
+                ohlcvts.removeByTimestamp(pvtHigh.timestamp)
+                pvMap.entries.removeAll { entry ->
+                    entry.value.second < pvtHigh.timestamp
+                }
+                pvtPoint = pvtHigh
+            }
+            if (pvtLow != null) {
+                ohlcvts.removeByTimestamp(pvtLow.timestamp)
+                pvMap.entries.removeAll { entry ->
+                    entry.value.second < pvtLow.timestamp
+                }
+                pvtPoint = pvtLow
+            }
+        }
+
+        if(fairValue > 0 && areaValue != null){
+            if (price < areaValue!!.max() && price > areaValue!!.min()) {
+                if (price > fairValue) {
+                    tradeLog.positionList.add(-price)
+                    tradeLog.position--
+                }
+                if (price < fairValue) {
+                    tradeLog.positionList.add(price)
+                    tradeLog.position++
+                }
+            }
+        }
+
+        ohlcvts.add(ohlcvt)
+    }
+
+    private fun processTradeInternal(trade: BinanceTrade?) {
+        if (trade == null) return
+        pvMap[trade.price.toDouble()] =
+            Pair(
+                pvMap[trade.price.toDouble()]?.first?.plus(trade.quantity.toDouble()) ?: (trade.quantity.toDouble()),
+                trade.tradeTime
             )
-            if (ohlcvts.size() > 0 && ohlcvts[0].timestamp == ohlcvt.timestamp) {
-                ohlcvts[0] = ohlcvt
-                return@launch
+        price = trade.price.toDouble()
+        safePrint("[${pvtPoint?.timestamp}] [${pvMap.size}] " +
+                "\n[${fairValue}] [${areaValue?.min()} - ${areaValue?.max()}]" +
+                "\nTrader: ${tradeLog.positionList.sum()} Position: ${tradeLog.position}\n" + pvMap.toString())
+    }
+
+    init {
+        startProcessors()
+    }
+
+    private fun startProcessors() {
+        GlobalScope.launch(Dispatchers.IO) {
+            klineChannel.consumeEach { kline ->
+                processKlineInternal(kline)
             }
+        }
 
-
-            if (ohlcvts.size() > 0) {
-                val pvtHigh = pivotDetector.pivothigh()
-                val pvtLow = pivotDetector.pivotlow()
-                if (pvtHigh != null) {
-                    ohlcvts.removeByTimestamp(pvtHigh.timestamp)
-                    pvMap.entries.removeAll { entry ->
-                        entry.value.second < pvtHigh.timestamp
-                    }
-
-                }
-                if (pvtLow != null) {
-                    ohlcvts.removeByTimestamp(pvtLow.timestamp)
-                    pvMap.entries.removeAll { entry ->
-                        entry.value.second < pvtLow.timestamp
-                    }
-                }
+        GlobalScope.launch(Dispatchers.IO) {
+            tradeChannel.consumeEach { trade ->
+                processTradeInternal(trade)
             }
-
-            if(fairValue > 0 && areaValue != null){
-                if (price < areaValue!!.max() && price > areaValue!!.min()) {
-                    if (price > fairValue) {
-                        tradeLog.positionList.add(-price)
-                        tradeLog.position--
-                    }
-                    if (price < fairValue) {
-                        tradeLog.positionList.add(price)
-                        tradeLog.position++
-                    }
-                }
-            }
-
-
-            ohlcvts.add(ohlcvt) // 生成下一根K
+        }
+    }
+    fun processKline(kline: BinanceKline?) {
+        runBlocking {
+            klineChannel.send(kline)
         }
     }
 
 
     fun processTrade(trade: BinanceTrade?) {
-        GlobalScope.launch(Dispatchers.IO) {
-            if (trade == null) return@launch
-            pvMap[trade.price.toDouble()] =
-                Pair(
-                    pvMap[trade.price.toDouble()]?.first?.plus(trade.quantity.toDouble()) ?: (trade.quantity.toDouble()),
-                    trade.tradeTime
-                )
-            price = trade.price.toDouble()
-            safePrint("[${ohlcvts.size()}] [${pvMap.size}] " +
-                    "\n[${fairValue}] [${areaValue?.size}]" +
-                    "\nTrader: ${tradeLog.positionList.sum()} Position: ${tradeLog.position}\n" + pvMap.toString())
+        runBlocking {
+            tradeChannel.send(trade)
         }
     }
 

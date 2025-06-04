@@ -8,7 +8,7 @@ import javax.net.ssl.SSLSocketFactory
 
 
 fun main() {
-    val binanceUrl = "wss://stream.binance.com:443/ws"
+    val binanceUrl = "wss://data-stream.binance.vision/ws"
     println(binanceUrl)
     val binanceUri = URI(binanceUrl)
     val gson = Gson()
